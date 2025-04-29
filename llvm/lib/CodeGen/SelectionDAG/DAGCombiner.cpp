@@ -8131,7 +8131,7 @@ static SDValue foldMaskedMergeImpl(SDValue AndL0, SDValue AndR0, SDValue AndL1,
 /// This is typically a better representation for targets without a fused
 /// "and-not" operation.
 static SDValue foldMaskedMerge(SDNode *Node, SelectionDAG &DAG,
-                               const SDLoc &DL) {
+                               const TargetLowering &TLI, const SDLoc &DL) {
   // Note that masked-merge variants using XOR or ADD expressions are
   // normalized to OR by InstCombine so we only check for OR.
   assert(Node->getOpcode() == ISD::OR && "Must be called with ISD::OR node");
@@ -8141,6 +8141,11 @@ static SDValue foldMaskedMerge(SDNode *Node, SelectionDAG &DAG,
   SDValue N1 = Node->getOperand(1);
   if (N1->getOpcode() != ISD::AND || !N1->hasOneUse())
     return SDValue();
+
+  // If the target supports and-not, don't fold this.
+  if (TLI.hasAndNot(SDValue(Node, 0)))
+    return SDValue();
+
   SDValue N00 = N0->getOperand(0);
   SDValue N01 = N0->getOperand(1);
   SDValue N10 = N1->getOperand(0);
@@ -8334,8 +8339,8 @@ SDValue DAGCombiner::visitOR(SDNode *N) {
     if (SDValue R = foldLogicTreeOfShifts(N, N0, N1, DAG))
       return R;
 
-  if (!TLI.hasAndNot(SDValue(N, 0)) && VT.isScalarInteger() && VT != MVT::i1)
-    if (SDValue R = foldMaskedMerge(N, DAG, DL))
+  if (VT.isScalarInteger() && VT != MVT::i1)
+    if (SDValue R = foldMaskedMerge(N, DAG, TLI, DL))
       return R;
 
   return SDValue();
