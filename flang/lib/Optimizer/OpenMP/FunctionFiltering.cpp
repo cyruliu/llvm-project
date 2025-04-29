@@ -30,6 +30,104 @@ namespace flangomp {
 
 using namespace mlir;
 
+/// Add an operation to one of the output sets to be later rewritten, based on
+/// whether it is located within the given region.
+template <typename OpTy>
+static void collectRewriteImpl(OpTy op, Region &region,
+                               llvm::SetVector<OpTy> &rewrites,
+                               llvm::SetVector<Operation *> *parentRewrites) {
+  if (rewrites.contains(op))
+    return;
+
+  if (!parentRewrites || region.isAncestor(op->getParentRegion()))
+    rewrites.insert(op);
+  else
+    parentRewrites->insert(op.getOperation());
+}
+
+template <typename OpTy>
+static void collectRewrite(OpTy op, Region &region,
+                           llvm::SetVector<OpTy> &rewrites,
+                           llvm::SetVector<Operation *> *parentRewrites) {
+  collectRewriteImpl(op, region, rewrites, parentRewrites);
+}
+
+/// Add an \c omp.map.info operation and all its members recursively to one of
+/// the output sets to be later rewritten, based on whether they are located
+/// within the given region.
+///
+/// Dependencies across \c omp.map.info are maintained by ensuring dependencies
+/// are added to the output sets before operations based on them.
+template <>
+void collectRewrite(omp::MapInfoOp mapOp, Region &region,
+                    llvm::SetVector<omp::MapInfoOp> &rewrites,
+                    llvm::SetVector<Operation *> *parentRewrites) {
+  for (Value member : mapOp.getMembers())
+    collectRewrite(cast<omp::MapInfoOp>(member.getDefiningOp()), region,
+                   rewrites, parentRewrites);
+
+  collectRewriteImpl(mapOp, region, rewrites, parentRewrites);
+}
+
+/// Add the given value to a sorted set if it should be replaced by a
+/// placeholder when used as an operand that must remain for the device. The
+/// used output set used will depend on whether the value is defined within the
+/// given region.
+///
+/// Values that are block arguments of \c omp.target_data and \c func.func
+/// operations are skipped, since they will still be available after all
+/// rewrites are completed.
+static void collectRewrite(Value value, Region &region,
+                           llvm::SetVector<Value> &rewrites,
+                           llvm::SetVector<Value> *parentRewrites) {
+  if ((isa<BlockArgument>(value) &&
+       isa<func::FuncOp, omp::TargetDataOp>(
+           cast<BlockArgument>(value).getOwner()->getParentOp())) ||
+      rewrites.contains(value))
+    return;
+
+  if (!parentRewrites) {
+    rewrites.insert(value);
+    return;
+  }
+
+  Region *definingRegion;
+  if (auto blockArg = dyn_cast<BlockArgument>(value))
+    definingRegion = blockArg.getOwner()->getParent();
+  else
+    definingRegion = value.getDefiningOp()->getParentRegion();
+
+  assert(definingRegion && "defining op/block must exist in a region");
+
+  if (region.isAncestor(definingRegion))
+    rewrites.insert(value);
+  else
+    parentRewrites->insert(value);
+}
+
+/// Add operations in \c childRewrites to one of the output sets based on
+/// whether they are located within the given region.
+template <typename OpTy>
+static void
+applyChildRewrites(Region &region,
+                   const llvm::SetVector<Operation *> &childRewrites,
+                   llvm::SetVector<OpTy> &rewrites,
+                   llvm::SetVector<Operation *> *parentRewrites) {
+  for (Operation *rewrite : childRewrites)
+    if (auto op = dyn_cast<OpTy>(*rewrite))
+      collectRewrite(op, region, rewrites, parentRewrites);
+}
+
+/// Add values in \c childRewrites to one of the output sets based on
+/// whether they are defined within the given region.
+static void applyChildRewrites(Region &region,
+                               const llvm::SetVector<Value> &childRewrites,
+                               llvm::SetVector<Value> &rewrites,
+                               llvm::SetVector<Value> *parentRewrites) {
+  for (Value value : childRewrites)
+    collectRewrite(value, region, rewrites, parentRewrites);
+}
+
 namespace {
 class FunctionFilteringPass
     : public flangomp::impl::FunctionFilteringPassBase<FunctionFilteringPass> {
@@ -111,33 +209,6 @@ public:
   }
 
 private:
-  /// Add the given \c omp.map.info to a sorted set while taking into account
-  /// its dependencies.
-  static void collectMapInfos(omp::MapInfoOp mapOp, Region &region,
-                              llvm::SetVector<omp::MapInfoOp> &mapInfos) {
-    for (Value member : mapOp.getMembers())
-      collectMapInfos(cast<omp::MapInfoOp>(member.getDefiningOp()), region,
-                      mapInfos);
-
-    if (region.isAncestor(mapOp->getParentRegion()))
-      mapInfos.insert(mapOp);
-  }
-
-  /// Add the given value to a sorted set if it should be replaced by a
-  /// placeholder when used as a pointer-like argument to an operation
-  /// participating in the initialization of an \c omp.map.info.
-  static void markPtrOperandForRewrite(Value value,
-                                       llvm::SetVector<Value> &rewriteValues) {
-    // We don't need to rewrite operands if they are defined by block arguments
-    // of operations that will still remain after the region is rewritten.
-    if (isa<BlockArgument>(value) &&
-        isa<func::FuncOp, omp::TargetDataOp>(
-            cast<BlockArgument>(value).getOwner()->getParentOp()))
-      return;
-
-    rewriteValues.insert(value);
-  }
-
   /// Rewrite the given host device region belonging to a function that contains
   /// \c omp.target operations, to remove host-only operations that are not used
   /// by device codegen.
@@ -150,7 +221,19 @@ private:
   ///     are nested inside of any other operations, they are hoisted out of
   ///     them. If the region belongs to \c omp.target_data, these operations
   ///     are hoisted to its top level, rather than to the parent function.
-  ///   - Only \c omp.map.info operations associated to these target regions are
+  ///   - \c device, \c if and \c depend clauses are removed from these target
+  ///     functions. Values initializing other clauses are either replaced by
+  ///     placeholders as follows:
+  ///     - Values defined by block arguments are replaced by placeholders only
+  ///       if they are not attached to \c func.func or \c omp.target_data
+  ///       operations. In that case, they are kept unmodified.
+  ///     - \c arith.constant and \c fir.address_of are maintained.
+  ///     - Other values are replaced by a combination of an \c fir.alloca for a
+  ///       single bit and an \c fir.convert to the original type of the value.
+  ///       This can be done because the code eventually generated for these
+  ///       operations will be discarded, as they aren't runnable by the target
+  ///       device.
+  ///   - \c omp.map.info operations associated to these target regions are
   ///     preserved. These are moved above all \c omp.target and sorted to
   ///     satisfy dependencies among them.
   ///   - \c bounds arguments are removed from \c omp.map.info operations.
@@ -159,16 +242,24 @@ private:
   ///     - \c var_ptr_ptr is expected to be defined by a \c fir.box_offset
   ///       operation which is preserved. Otherwise, the pass will fail.
   ///     - \c var_ptr can be defined by an \c hlfir.declare which is also
-  ///       preserved. If the \c var_ptr or \c hlfir.declare \c memref argument
-  ///       is a \c fir.address_of operation, that operation is also maintained.
-  ///       Otherwise, it is replaced by a placeholder \c fir.alloca and a
-  ///       \c fir.convert or kept unmodified when it is defined by an entry
-  ///       block argument. If it has \c shape or \c typeparams arguments, they
-  ///       are also replaced by applicable constants. \c dummy_scope arguments
+  ///       preserved. Its \c memref argument is replaced by a placeholder or
+  ///       maintained similarly to non-map clauses of target operations
+  ///       described above. If it has \c shape or \c typeparams arguments, they
+  ///       are replaced by applicable constants. \c dummy_scope arguments
   ///       are discarded.
   ///   - Every other operation not located inside of an \c omp.target is
   ///     removed.
-  LogicalResult rewriteHostRegion(Region &region) {
+  ///   - Whenever a value or operation that would otherwise be replaced with a
+  ///     placeholder is defined outside of the region being rewritten, it is
+  ///     added to the \c parentOpRewrites or \c parentValRewrites output
+  ///     argument, to be later handled by the caller. This is only intended to
+  ///     properly support nested \c omp.target_data and \c omp.target placed
+  ///     inside of \c omp.target_data. When called for the main function, these
+  ///     output arguments must not be set.
+  LogicalResult
+  rewriteHostRegion(Region &region,
+                    llvm::SetVector<Operation *> *parentOpRewrites = nullptr,
+                    llvm::SetVector<Value> *parentValRewrites = nullptr) {
     // Extract parent op information.
     auto [funcOp, targetDataOp] = [&region]() {
       Operation *parent = region.getParentOp();
@@ -177,6 +268,9 @@ private:
     }();
     assert((bool)funcOp != (bool)targetDataOp &&
            "region must be defined by either func.func or omp.target_data");
+    assert((bool)parentOpRewrites == (bool)targetDataOp &&
+           (bool)parentValRewrites == (bool)targetDataOp &&
+           "parent rewrites must be passed iff rewriting omp.target_data");
 
     // Collect operations that have mapping information associated to them.
     llvm::SmallVector<
@@ -184,6 +278,9 @@ private:
                      omp::TargetExitDataOp, omp::TargetUpdateOp>>
         targetOps;
 
+    // Sets to store pending rewrites marked by child omp.target_data ops.
+    llvm::SetVector<Operation *> childOpRewrites;
+    llvm::SetVector<Value> childValRewrites;
     WalkResult result = region.walk<WalkOrder::PreOrder>([&](Operation *op) {
       // Skip the inside of omp.target regions, since these contain device code.
       if (auto targetOp = dyn_cast<omp::TargetOp>(op)) {
@@ -193,7 +290,8 @@ private:
 
       if (auto targetOp = dyn_cast<omp::TargetDataOp>(op)) {
         // Recursively rewrite omp.target_data regions as well.
-        if (failed(rewriteHostRegion(targetOp.getRegion()))) {
+        if (failed(rewriteHostRegion(targetOp.getRegion(), &childOpRewrites,
+                                     &childValRewrites))) {
           targetOp.emitOpError() << "rewrite for target device failed";
           return WalkResult::interrupt();
         }
@@ -204,9 +302,9 @@ private:
 
       if (auto targetOp = dyn_cast<omp::TargetEnterDataOp>(op))
         targetOps.push_back(targetOp);
-      if (auto targetOp = dyn_cast<omp::TargetExitDataOp>(op))
+      else if (auto targetOp = dyn_cast<omp::TargetExitDataOp>(op))
         targetOps.push_back(targetOp);
-      if (auto targetOp = dyn_cast<omp::TargetUpdateOp>(op))
+      else if (auto targetOp = dyn_cast<omp::TargetUpdateOp>(op))
         targetOps.push_back(targetOp);
 
       return WalkResult::advance();
@@ -235,57 +333,87 @@ private:
       oldArg.replaceAllUsesWith(newArg);
 
     // Collect omp.map.info ops while satisfying interdependencies. This must be
-    // updated whenever new map-like clauses are introduced or they are attached
-    // to other operations.
+    // updated whenever operands to operations contained in targetOps change.
+    llvm::SetVector<Value> rewriteValues;
     llvm::SetVector<omp::MapInfoOp> mapInfos;
     for (auto targetOp : targetOps) {
       std::visit(
-          [&region, &mapInfos](auto op) {
+          [&](auto op) {
+            // Variables unused by the device, present on all target ops.
+            op.getDeviceMutable().clear();
+            op.getIfExprMutable().clear();
+
             for (Value mapVar : op.getMapVars())
-              collectMapInfos(cast<omp::MapInfoOp>(mapVar.getDefiningOp()),
-                              region, mapInfos);
+              collectRewrite(cast<omp::MapInfoOp>(mapVar.getDefiningOp()),
+                             region, mapInfos, parentOpRewrites);
+
+            if constexpr (!std::is_same_v<decltype(op), omp::TargetDataOp>) {
+              // Variables unused by the device, present on all target ops
+              // except for omp.target_data.
+              op.getDependVarsMutable().clear();
+              op.setDependKindsAttr(nullptr);
+            }
 
             if constexpr (std::is_same_v<decltype(op), omp::TargetOp>) {
+              assert(op.getHostEvalVars().empty() &&
+                     "unexpected host_eval in target device module");
+              // TODO: Clear some of these operands rather than rewriting them,
+              // depending on whether they are needed by device codegen once
+              // support for them is fully implemented.
+              for (Value allocVar : op.getAllocateVars())
+                collectRewrite(allocVar, region, rewriteValues,
+                               parentValRewrites);
+              for (Value allocVar : op.getAllocatorVars())
+                collectRewrite(allocVar, region, rewriteValues,
+                               parentValRewrites);
+              for (Value inReduction : op.getInReductionVars())
+                collectRewrite(inReduction, region, rewriteValues,
+                               parentValRewrites);
+              for (Value isDevPtr : op.getIsDevicePtrVars())
+                collectRewrite(isDevPtr, region, rewriteValues,
+                               parentValRewrites);
               for (Value mapVar : op.getHasDeviceAddrVars())
-                collectMapInfos(cast<omp::MapInfoOp>(mapVar.getDefiningOp()),
-                                region, mapInfos);
+                collectRewrite(cast<omp::MapInfoOp>(mapVar.getDefiningOp()),
+                               region, mapInfos, parentOpRewrites);
+              for (Value privateVar : op.getPrivateVars())
+                collectRewrite(privateVar, region, rewriteValues,
+                               parentValRewrites);
+              if (Value threadLimit = op.getThreadLimit())
+                collectRewrite(threadLimit, region, rewriteValues,
+                               parentValRewrites);
             } else if constexpr (std::is_same_v<decltype(op),
                                                 omp::TargetDataOp>) {
               for (Value mapVar : op.getUseDeviceAddrVars())
-                collectMapInfos(cast<omp::MapInfoOp>(mapVar.getDefiningOp()),
-                                region, mapInfos);
+                collectRewrite(cast<omp::MapInfoOp>(mapVar.getDefiningOp()),
+                               region, mapInfos, parentOpRewrites);
               for (Value mapVar : op.getUseDevicePtrVars())
-                collectMapInfos(cast<omp::MapInfoOp>(mapVar.getDefiningOp()),
-                                region, mapInfos);
+                collectRewrite(cast<omp::MapInfoOp>(mapVar.getDefiningOp()),
+                               region, mapInfos, parentOpRewrites);
             }
           },
           targetOp);
     }
 
+    applyChildRewrites(region, childOpRewrites, mapInfos, parentOpRewrites);
+
     // Move omp.map.info ops to the new block and collect dependencies.
     llvm::SetVector<hlfir::DeclareOp> declareOps;
     llvm::SetVector<fir::BoxOffsetOp> boxOffsets;
-    llvm::SetVector<Value> rewriteValues;
     for (omp::MapInfoOp mapOp : mapInfos) {
-      // Handle var_ptr: hlfir.declare.
       if (auto declareOp = dyn_cast_if_present<hlfir::DeclareOp>(
-              mapOp.getVarPtr().getDefiningOp())) {
-        if (region.isAncestor(declareOp->getParentRegion()))
-          declareOps.insert(declareOp);
-      } else {
-        markPtrOperandForRewrite(mapOp.getVarPtr(), rewriteValues);
-      }
+              mapOp.getVarPtr().getDefiningOp()))
+        collectRewrite(declareOp, region, declareOps, parentOpRewrites);
+      else
+        collectRewrite(mapOp.getVarPtr(), region, rewriteValues,
+                       parentValRewrites);
 
-      // Handle var_ptr_ptr: fir.box_offset.
       if (Value varPtrPtr = mapOp.getVarPtrPtr()) {
         if (auto boxOffset = llvm::dyn_cast_if_present<fir::BoxOffsetOp>(
-                varPtrPtr.getDefiningOp())) {
-          if (region.isAncestor(boxOffset->getParentRegion()))
-            boxOffsets.insert(boxOffset);
-        } else {
+                varPtrPtr.getDefiningOp()))
+          collectRewrite(boxOffset, region, boxOffsets, parentOpRewrites);
+        else
           return mapOp->emitOpError() << "var_ptr_ptr rewrite only supported "
                                          "if defined by fir.box_offset";
-        }
       }
 
       // Bounds are not used during target device codegen.
@@ -293,23 +421,19 @@ private:
       mapOp->moveBefore(&block, block.end());
     }
 
+    applyChildRewrites(region, childOpRewrites, declareOps, parentOpRewrites);
+    applyChildRewrites(region, childOpRewrites, boxOffsets, parentOpRewrites);
+
     // Create a temporary marker to simplify the op moving process below.
     builder.setInsertionPointToStart(&block);
     auto marker = builder.create<fir::UndefOp>(builder.getUnknownLoc(),
                                                builder.getNoneType());
     builder.setInsertionPoint(marker);
 
-    // Move dependencies of hlfir.declare ops.
+    // Handle dependencies of hlfir.declare ops.
     for (hlfir::DeclareOp declareOp : declareOps) {
-      Value memref = declareOp.getMemref();
-
-      // If it's defined by fir.address_of, then we need to keep that op as well
-      // because it might be pointing to a 'declare target' global.
-      if (auto addressOf =
-              dyn_cast_if_present<fir::AddrOfOp>(memref.getDefiningOp()))
-        addressOf->moveBefore(marker);
-      else
-        markPtrOperandForRewrite(memref, rewriteValues);
+      collectRewrite(declareOp.getMemref(), region, rewriteValues,
+                     parentValRewrites);
 
       // Shape and typeparams aren't needed for target device codegen, but
       // removing them would break verifiers.
@@ -338,18 +462,31 @@ private:
       declareOp.getDummyScopeMutable().clear();
     }
 
-    // We don't actually need the proper local allocations, but rather maintain
-    // the basic form of map operands. We create 1-bit placeholder allocas
-    // that we "typecast" to the expected pointer type and replace all uses.
+    // We don't actually need the proper initialization, but rather just
+    // maintain the basic form of these operands. We create 1-bit placeholder
+    // allocas that we "typecast" to the expected type and replace all uses.
     // Using fir.undefined here instead is not possible because these variables
     // cannot be constants, as that would trigger different codegen for target
     // regions.
+    applyChildRewrites(region, childValRewrites, rewriteValues,
+                       parentValRewrites);
     for (Value value : rewriteValues) {
       Location loc = value.getLoc();
-      Value placeholder =
-          builder.create<fir::AllocaOp>(loc, builder.getI1Type());
-      value.replaceAllUsesWith(
-          builder.create<fir::ConvertOp>(loc, value.getType(), placeholder));
+      Value rewriteValue;
+      // If it's defined by fir.address_of, then we need to keep that op as
+      // well because it might be pointing to a 'declare target' global.
+      // Constants can also trigger different codegen paths, so we keep them as
+      // well.
+      if (isa_and_present<arith::ConstantOp, fir::AddrOfOp>(
+              value.getDefiningOp())) {
+        rewriteValue = builder.clone(*value.getDefiningOp())->getResult(0);
+      } else {
+        Value placeholder =
+            builder.create<fir::AllocaOp>(loc, builder.getI1Type());
+        rewriteValue =
+            builder.create<fir::ConvertOp>(loc, value.getType(), placeholder);
+      }
+      value.replaceAllUsesWith(rewriteValue);
     }
 
     // Move omp.map.info dependencies.
@@ -358,13 +495,13 @@ private:
 
     // The box_ref argument of fir.box_offset is expected to be the same value
     // that was passed as var_ptr to the corresponding omp.map.info, so we don't
-    // need to move its defining op here.
+    // need to handle its defining op here.
     for (fir::BoxOffsetOp boxOffset : boxOffsets)
       boxOffset->moveBefore(marker);
 
     marker->erase();
 
-    // Move mapping information users to the end of the new block.
+    // Move target operations to the end of the new block.
     for (auto targetOp : targetOps)
       std::visit([&block](auto op) { op->moveBefore(&block, block.end()); },
                  targetOp);
@@ -383,8 +520,8 @@ private:
       builder.create<omp::TerminatorOp>(targetDataOp.getLoc());
     }
 
-    // Replace old (now missing ops) region with the new one and remove the
-    // temporary clone.
+    // Replace old region (now missing ops) with the new one and remove the
+    // temporary operation clone.
     region.takeBody(newOp->getRegion(0));
     newOp->erase();
     return success();

@@ -4,9 +4,9 @@ module attributes {omp.is_target_device = true} {
   // CHECK-LABEL: func.func @basic_checks
   // CHECK-SAME: (%[[ARG:.*]]: !fir.ref<i32>) -> (i32, f32)
   func.func @basic_checks(%arg: !fir.ref<i32>) -> (i32, f32) {
-    // CHECK-NEXT: %[[GLOBAL:.*]] = fir.address_of(@global_scalar) : !fir.ref<i32>
     // CHECK-NEXT: %[[PLACEHOLDER:.*]] = fir.alloca i1
     // CHECK-NEXT: %[[ALLOC:.*]] = fir.convert %[[PLACEHOLDER]] : (!fir.ref<i1>) -> !fir.ref<i32>
+    // CHECK-NEXT: %[[GLOBAL:.*]] = fir.address_of(@global_scalar) : !fir.ref<i32>
     %r0 = arith.constant 10 : i32
     %r1 = arith.constant 2.5 : f32
 
@@ -386,6 +386,93 @@ module attributes {omp.is_target_device = true} {
     return
   }
 
+  // CHECK-LABEL: func.func @reuse_tests()
+  func.func @reuse_tests() {
+    // CHECK-NEXT: %[[PLACEHOLDER:.*]] = fir.alloca i1
+    // CHECK-NEXT: %[[THREAD_LIMIT:.*]] = fir.convert %[[PLACEHOLDER]] : (!fir.ref<i1>) -> i32
+    // CHECK-NEXT: %[[CONST:.*]] = arith.constant 1 : i32
+    // CHECK-NEXT: %[[GLOBAL:.*]] = fir.address_of(@global_scalar) : !fir.ref<i32>
+    %global = fir.address_of(@global_scalar) : !fir.ref<i32>
+    // CHECK-NEXT: %[[GLOBAL_DECL0:.*]]:2 = hlfir.declare %[[GLOBAL]] {uniq_name = "global_scalar"}
+    // CHECK-NEXT: %[[GLOBAL_DECL1:.*]]:2 = hlfir.declare %[[GLOBAL]] {uniq_name = "global_scalar"}
+    %0:2 = hlfir.declare %global {uniq_name = "global_scalar"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+    // CHECK-NEXT: %[[MAP0:.*]] = omp.map.info var_ptr(%[[GLOBAL_DECL0]]#1 : !fir.ref<i32>, i32)
+    // CHECK-NEXT: %[[MAP3:.*]] = omp.map.info var_ptr(%[[GLOBAL_DECL1]]#1 : !fir.ref<i32>, i32)
+    %m0 = omp.map.info var_ptr(%0#1 : !fir.ref<i32>, i32) map_clauses(tofrom) capture(ByRef) -> !fir.ref<i32>
+    // CHECK-NEXT: omp.target_data map_entries(%[[MAP0]] : !fir.ref<i32>)
+    omp.target_data map_entries(%m0 : !fir.ref<i32>) {
+      // CHECK-NEXT: %[[GLOBAL_DECL2:.*]]:2 = hlfir.declare %[[GLOBAL]] {uniq_name = "global_scalar"}
+      %1:2 = hlfir.declare %global {uniq_name = "global_scalar"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+      // CHECK-NEXT: %[[MAP1:.*]] = omp.map.info var_ptr(%[[GLOBAL_DECL0]]#1 : !fir.ref<i32>, i32)
+      %m1 = omp.map.info var_ptr(%0#1 : !fir.ref<i32>, i32) map_clauses(tofrom) capture(ByRef) -> !fir.ref<i32>
+      // CHECK-NEXT: %[[MAP2:.*]] = omp.map.info var_ptr(%[[GLOBAL_DECL2]]#1 : !fir.ref<i32>, i32)
+      %m2 = omp.map.info var_ptr(%1#1 : !fir.ref<i32>, i32) map_clauses(tofrom) capture(ByRef) -> !fir.ref<i32>
+      // CHECK-NEXT: omp.target map_entries(%[[MAP1]] -> %{{.*}}, %[[MAP2]] -> {{.*}} : !fir.ref<i32>, !fir.ref<i32>)
+      omp.target map_entries(%m1 -> %arg0, %m2 -> %arg1 : !fir.ref<i32>, !fir.ref<i32>) {
+        omp.terminator
+      }
+      omp.terminator
+    }
+    // CHECK-NOT: fir.load
+    // CHECK-NOT: hlfir.declare
+    %2 = fir.load %global : !fir.ref<i32>
+    %3:2 = hlfir.declare %global {uniq_name = "global_scalar"} : (!fir.ref<i32>) -> (!fir.ref<i32>, !fir.ref<i32>)
+    %m3 = omp.map.info var_ptr(%3#1 : !fir.ref<i32>, i32) map_clauses(tofrom) capture(ByRef) -> !fir.ref<i32>
+    // CHECK: omp.target thread_limit(%[[THREAD_LIMIT]] : i32) map_entries(%[[MAP3]] -> %{{.*}} : !fir.ref<i32>)
+    omp.target thread_limit(%2 : i32) map_entries(%m3 -> %arg0 : !fir.ref<i32>) {
+      omp.terminator
+    }
+    // CHECK: omp.target thread_limit(%[[CONST]] : i32)
+    %c1 = arith.constant 1 : i32
+    omp.target thread_limit(%c1 : i32) {
+      omp.terminator
+    }
+    // CHECK: omp.target thread_limit(%[[CONST]] : i32)
+    omp.target thread_limit(%c1 : i32) {
+      omp.terminator
+    }
+    return
+  }
+
+  // CHECK-LABEL: func.func @all_non_map_clauses
+  // CHECK-SAME: (%[[REF:.*]]: !fir.ref<i32>, %[[INT:.*]]: i32, %[[BOOL:.*]]: i1)
+  func.func @all_non_map_clauses(%ref: !fir.ref<i32>, %int: i32, %bool: i1) {
+    %m0 = omp.map.info var_ptr(%ref : !fir.ref<i32>, i32) map_clauses(tofrom) capture(ByRef) -> !fir.ref<i32>
+    // CHECK: omp.target_data map_entries({{[^)]*}}) {
+    omp.target_data device(%int : i32) if(%bool) map_entries(%m0 : !fir.ref<i32>) {
+      omp.terminator
+    }
+    // CHECK: omp.target allocate({{[^)]*}}) thread_limit({{[^)]*}}) in_reduction({{[^)]*}}) private({{[^)]*}}) {
+    omp.target allocate(%ref : !fir.ref<i32> -> %ref : !fir.ref<i32>)
+               depend(taskdependin -> %ref : !fir.ref<i32>)
+               device(%int : i32) if(%bool) thread_limit(%int : i32)
+               in_reduction(@reduction %ref -> %arg0 : !fir.ref<i32>)
+               private(@privatizer %ref -> %arg1 : !fir.ref<i32>) {
+      omp.terminator
+    }
+    // CHECK: omp.target_enter_data
+    // CHECK-NOT: depend
+    // CHECK-NOT: device
+    // CHECK-NOT: if
+    omp.target_enter_data depend(taskdependin -> %ref : !fir.ref<i32>)
+                          device(%int : i32) if(%bool)
+    // CHECK-NEXT: omp.target_exit_data
+    // CHECK-NOT: depend
+    // CHECK-NOT: device
+    // CHECK-NOT: if
+    omp.target_exit_data depend(taskdependin -> %ref : !fir.ref<i32>)
+                         device(%int : i32) if(%bool)
+    // CHECK-NEXT: omp.target_update
+    // CHECK-NOT: depend
+    // CHECK-NOT: device
+    // CHECK-NOT: if
+    omp.target_update depend(taskdependin -> %ref : !fir.ref<i32>)
+                      device(%int : i32) if(%bool)
+
+    // CHECK-NEXT: return
+    return
+  }
+
   func.func private @foo() -> () attributes {omp.declare_target = #omp.declaretarget<device_type = (any), capture_clause = (enter)>}
   fir.global internal @global_scalar constant : i32 {
     %0 = arith.constant 10 : i32
@@ -396,5 +483,16 @@ module attributes {omp.is_target_device = true} {
     %0 = fir.load %arg0 : !fir.ref<i32>
     hlfir.assign %0 to %arg1 : i32, !fir.ref<i32>
     omp.yield(%arg1 : !fir.ref<i32>)
+  }
+  omp.declare_reduction @reduction : i32
+  init {
+  ^bb0(%arg: i32):
+    %0 = arith.constant 0 : i32
+    omp.yield (%0 : i32)
+  }
+  combiner {
+  ^bb1(%arg0: i32, %arg1: i32):
+    %1 = arith.addi %arg0, %arg1 : i32
+    omp.yield (%1 : i32)
   }
 }
