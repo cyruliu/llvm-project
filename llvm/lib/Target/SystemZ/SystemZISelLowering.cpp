@@ -1297,8 +1297,17 @@ bool SystemZTargetLowering::allowsMisalignedMemoryAccesses(
 }
 
 bool SystemZTargetLowering::hasAndNot(SDValue Y) const {
-  // requires VNC instruction
-  return Subtarget.hasVector() && Y.getValueType().getScalarSizeInBits() <= 128;
+  EVT VT = Y.getValueType();
+
+  // We can use NC(G)RK for types in GPRs ...
+  if (VT == MVT::i32 || VT == MVT::i64)
+    return Subtarget.hasMiscellaneousExtensions3();
+
+  // ... or VNC for types in VRs.
+  if (VT.isVector() || VT == MVT::i128)
+    return Subtarget.hasVector();
+
+  return false;
 }
 
 // Information about the addressing mode for a memory access.
