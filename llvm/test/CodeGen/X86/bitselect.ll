@@ -43,10 +43,10 @@ define i8 @bitselect_i8(i8 %a, i8 %b, i8 %m) nounwind {
 define i16 @bitselect_i16(i16 %a, i16 %b, i16 %m) nounwind {
 ; X86-LABEL: bitselect_i16:
 ; X86:       # %bb.0:
+; X86-NEXT:    movl {{[0-9]+}}(%esp), %ecx
 ; X86-NEXT:    movzwl {{[0-9]+}}(%esp), %eax
-; X86-NEXT:    movzwl {{[0-9]+}}(%esp), %ecx
-; X86-NEXT:    xorw %ax, %cx
-; X86-NEXT:    andw {{[0-9]+}}(%esp), %cx
+; X86-NEXT:    xorw %cx, %ax
+; X86-NEXT:    andw {{[0-9]+}}(%esp), %ax
 ; X86-NEXT:    xorl %ecx, %eax
 ; X86-NEXT:    # kill: def $ax killed $ax killed $eax
 ; X86-NEXT:    retl
@@ -108,16 +108,18 @@ define i32 @bitselect_i32(i32 %a, i32 %b, i32 %m) nounwind {
 define i64 @bitselect_i64(i64 %a, i64 %b, i64 %m) nounwind {
 ; X86-LABEL: bitselect_i64:
 ; X86:       # %bb.0:
+; X86-NEXT:    pushl %esi
 ; X86-NEXT:    movl {{[0-9]+}}(%esp), %ecx
-; X86-NEXT:    movl {{[0-9]+}}(%esp), %edx
+; X86-NEXT:    movl {{[0-9]+}}(%esp), %esi
 ; X86-NEXT:    movl {{[0-9]+}}(%esp), %eax
-; X86-NEXT:    xorl %edx, %eax
+; X86-NEXT:    xorl %ecx, %eax
 ; X86-NEXT:    andl {{[0-9]+}}(%esp), %eax
-; X86-NEXT:    xorl %edx, %eax
+; X86-NEXT:    xorl %ecx, %eax
 ; X86-NEXT:    movl {{[0-9]+}}(%esp), %edx
-; X86-NEXT:    xorl %ecx, %edx
+; X86-NEXT:    xorl %esi, %edx
 ; X86-NEXT:    andl {{[0-9]+}}(%esp), %edx
-; X86-NEXT:    xorl %ecx, %edx
+; X86-NEXT:    xorl %esi, %edx
+; X86-NEXT:    popl %esi
 ; X86-NEXT:    retl
 ;
 ; X64-NOBMI-LABEL: bitselect_i64:
@@ -147,15 +149,15 @@ define i128 @bitselect_i128(i128 %a, i128 %b, i128 %m) nounwind {
 ; X86-NEXT:    pushl %ebx
 ; X86-NEXT:    pushl %edi
 ; X86-NEXT:    pushl %esi
-; X86-NEXT:    movl {{[0-9]+}}(%esp), %ecx
-; X86-NEXT:    movl {{[0-9]+}}(%esp), %esi
-; X86-NEXT:    movl {{[0-9]+}}(%esp), %ebx
-; X86-NEXT:    movl {{[0-9]+}}(%esp), %edi
 ; X86-NEXT:    movl {{[0-9]+}}(%esp), %eax
+; X86-NEXT:    movl {{[0-9]+}}(%esp), %esi
 ; X86-NEXT:    movl {{[0-9]+}}(%esp), %edx
-; X86-NEXT:    xorl %edi, %edx
-; X86-NEXT:    andl {{[0-9]+}}(%esp), %edx
-; X86-NEXT:    xorl %edi, %edx
+; X86-NEXT:    movl {{[0-9]+}}(%esp), %edi
+; X86-NEXT:    movl {{[0-9]+}}(%esp), %ebx
+; X86-NEXT:    movl {{[0-9]+}}(%esp), %ecx
+; X86-NEXT:    xorl %edi, %ecx
+; X86-NEXT:    andl {{[0-9]+}}(%esp), %ecx
+; X86-NEXT:    xorl %edi, %ecx
 ; X86-NEXT:    movl {{[0-9]+}}(%esp), %edi
 ; X86-NEXT:    xorl %ebx, %edi
 ; X86-NEXT:    andl {{[0-9]+}}(%esp), %edi
@@ -165,13 +167,13 @@ define i128 @bitselect_i128(i128 %a, i128 %b, i128 %m) nounwind {
 ; X86-NEXT:    andl {{[0-9]+}}(%esp), %ebx
 ; X86-NEXT:    xorl %esi, %ebx
 ; X86-NEXT:    movl {{[0-9]+}}(%esp), %esi
-; X86-NEXT:    xorl %ecx, %esi
+; X86-NEXT:    xorl %edx, %esi
 ; X86-NEXT:    andl {{[0-9]+}}(%esp), %esi
-; X86-NEXT:    xorl %ecx, %esi
+; X86-NEXT:    xorl %edx, %esi
 ; X86-NEXT:    movl %esi, 12(%eax)
 ; X86-NEXT:    movl %ebx, 8(%eax)
 ; X86-NEXT:    movl %edi, 4(%eax)
-; X86-NEXT:    movl %edx, (%eax)
+; X86-NEXT:    movl %ecx, (%eax)
 ; X86-NEXT:    popl %esi
 ; X86-NEXT:    popl %edi
 ; X86-NEXT:    popl %ebx

@@ -1296,6 +1296,12 @@ bool SystemZTargetLowering::allowsMisalignedMemoryAccesses(
   return true;
 }
 
+bool SystemZTargetLowering::hasAndNot(SDValue Y) const {
+  // requires VNC instruction
+  return Subtarget.hasVector() &&
+    Y.getValueType().getScalarSizeInBits() <= 128;
+}
+
 // Information about the addressing mode for a memory access.
 struct AddressingMode {
   // True if a long displacement is supported.
