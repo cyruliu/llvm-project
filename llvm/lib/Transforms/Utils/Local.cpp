@@ -4220,8 +4220,11 @@ bool llvm::canReplaceOperandWithVariable(const Instruction *I, unsigned OpIdx) {
     return false;
 
   // Early exit.
-  if (!isa<Constant>(I->getOperand(OpIdx)))
+  if (!isa<Constant>(I->getOperand(OpIdx))) {
+    if (const auto *CB = dyn_cast<CallBase>(I))
+      return !CB->isInlineAsm();
     return true;
+  }
 
   switch (I->getOpcode()) {
   default:
